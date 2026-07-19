@@ -1,0 +1,175 @@
+name: Daily Build
+
+on:
+  schedule:
+    # 每天 03:00 UTC 运行一次
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    # 手动触发方式 1: GitHub 网页 / gh CLI 的 "Run workflow" 按钮
+    inputs:
+      force:
+        description: 'Build even if there are no new commits since the last release'
+        type: boolean
+        default: false
+  repository_dispatch:
+    # 手动触发方式 2: 通过 API/webhook 调用
+    #   curl -X POST -H "Authorization: token <PAT>" \
+    #     https://api.github.com/repos/<owner>/<repo>/dispatches \
+    #     -d '{"event_type":"manual-build"}'
+    types: [manual-build]
+
+env:
+  # 本仓库只放 workflow,不放 Osiris 源码。源码在构建时从上游仓库拉取。
+  UPSTREAM_REPO: danielkrupinski/Osiris
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-build
+  cancel-in-progress: false
+
+jobs:
+  check-changes:
+    name: Check upstream for new commits
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      sha: ${{ steps.check.outputs.sha }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
+      date: ${{ steps.check.outputs.date }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine whether a new build is needed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_SHA=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" HEAD | cut -f1)
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "Failed to resolve upstream HEAD" >&2
+            exit 1
+          fi
+          SHORT_SHA=${CURRENT_SHA:0:7}
+          echo "sha=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "Manual run with force=true, building regardless of new commits."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 用 tag 里携带的 short SHA 判断这个上游 commit 是否已经构建发布过
+          # (target_commitish 只能指向本仓库自己的分支,不能指向上游仓库的 commit)
+          ALREADY_BUILT=$(gh release list --limit 100 --json tagName \
+            --jq ".[] | select(.tagName | endswith(\"-$SHORT_SHA\")) | .tagName" 2>/dev/null | head -n1 || true)
+          if [ -n "$ALREADY_BUILT" ]; then
+            echo "Upstream commit $SHORT_SHA already built as $ALREADY_BUILT, skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream commit $SHORT_SHA found, building."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-windows:
+    name: Windows (${{ matrix.toolset }})
+    needs: check-changes
+    if: needs.check-changes.outputs.should_run == 'true'
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset: [MSVC, ClangCL]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-changes.outputs.sha }}
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Osiris.dll (Release|x64)
+        shell: pwsh
+        run: |
+          $buildArgs = @('Osiris.sln', '/p:Platform=x64', '/p:Configuration=Release', '/m')
+          if ('${{ matrix.toolset }}' -eq 'ClangCL') {
+            $buildArgs += '/p:PlatformToolset=ClangCL'
+          }
+          msbuild @buildArgs
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path . -Recurse -Filter 'Osiris.dll' |
+            Where-Object { $_.FullName -match '\\Release\\' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $dll) { throw 'Osiris.dll build output not found' }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $dll.FullName "dist/Osiris-Windows-x64-${{ matrix.toolset }}.dll"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.toolset }}
+          path: dist/*.dll
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux
+    needs: check-changes
+    if: needs.check-changes.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-changes.outputs.sha }}
+
+      - name: Configure
+        run: CXX=g++-13 cmake -DCMAKE_BUILD_TYPE=Release -B build
+
+      - name: Build
+        run: cmake --build build --target Osiris -j "$(nproc --all)"
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp build/Source/libOsiris.so dist/Osiris-Linux-x64.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/*.so
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [check-changes, build-windows, build-linux]
+    if: needs.check-changes.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.dll' -o -name '*.so' \) -exec cp {} release/ \;
+          ls -la release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ needs.check-changes.outputs.date }}-${{ needs.check-changes.outputs.short_sha }}"
+          gh release create "$TAG" release/* \
+            --title "Daily Build ${{ needs.check-changes.outputs.date }} (${{ needs.check-changes.outputs.short_sha }})" \
+            --notes "Automated build of ${{ env.UPSTREAM_REPO }}@${{ needs.check-changes.outputs.sha }}." \
+            --prerelease

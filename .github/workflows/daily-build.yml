@@ -130,7 +130,7 @@ jobs:
           ref: ${{ needs.check-changes.outputs.sha }}
 
       - name: Configure
-        run: CXX=g++-15 cmake -DCMAKE_BUILD_TYPE=Release -B build
+        run: CXX=g++-13 cmake -DCMAKE_BUILD_TYPE=Release -B build
 
       - name: Build
         run: cmake --build build --target Osiris -j "$(nproc --all)"

@@ -120,7 +120,7 @@ jobs:
       - name: Install toolchain
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends cmake git g++-15 ca-certificates
+          apt-get install -y --no-install-recommends cmake ninja-build git g++-15 ca-certificates
 
       - uses: actions/checkout@v6
         with:
@@ -128,7 +128,13 @@ jobs:
           ref: ${{ needs.check-changes.outputs.sha }}
 
       - name: Configure
-        run: CXX=g++-15 cmake -DCMAKE_BUILD_TYPE=Release -B build
+        run: >-
+          cmake
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=g++-15
+          -S .
+          -B build
 
       - name: Build
         run: cmake --build build --target Osiris -j "$(nproc --all)"
